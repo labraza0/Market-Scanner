@@ -14,12 +14,9 @@ SPARK_WEBHOOK_URL = os.environ.get("SPARK_WEBHOOK_URL")
 SPARK_WEBHOOK_SECRET = os.environ.get("SPARK_WEBHOOK_SECRET")
 SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID", "104Ppc5PLFXMvbn6irukd5KJVY53An25sNvX8V1KbdXA")
 
-# Fallback default core watchlist if Sheet is unreachable
 DEFAULT_CORE = ["NVDA", "AMZN", "SMH", "PYPL", "MAGS", "FTNT", "ADBE", "SNAP"]
-
 CACHE_FILE = ".scanner_cache.json"
 
-# Key liquid benchmark tickers from S&P 500 and Nasdaq 100 to scan for dynamic breakouts
 TOP_UNIVERSE_DISCOVERY = [
     # Mega-Caps & Tech
     "AAPL", "MSFT", "GOOGL", "META", "TSLA", "AVGO", "AMD", "QCOM", "TXN",
@@ -34,7 +31,6 @@ TOP_UNIVERSE_DISCOVERY = [
 ]
 
 def load_alert_cache() -> set:
-    """Loads previously dispatched alerts for the current UTC trading date."""
     today = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
     if os.path.exists(CACHE_FILE):
         try:
@@ -47,7 +43,6 @@ def load_alert_cache() -> set:
     return set()
 
 def save_alert_cache(dispatched_set: set):
-    """Saves dispatched alerts for the current date."""
     today = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
     try:
         with open(CACHE_FILE, "w") as f:
@@ -56,8 +51,7 @@ def save_alert_cache(dispatched_set: set):
         print(f"Warning: Could not save alert cache: {e}", file=sys.stderr)
 
 def fetch_watchlist_from_google_sheet() -> list:
-    """Fetches ACTIVE tickers from the synchronized Google Sheet CSV export."""
-    csv_url = f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/export?format=csv"
+    csv_url = f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/export?format=csv&gid=0"
     try:
         req = urllib.request.Request(csv_url, headers={"User-Agent": "MarketScanner"})
         with urllib.request.urlopen(req, timeout=10) as resp:
@@ -72,11 +66,55 @@ def fetch_watchlist_from_google_sheet() -> list:
                 print(f"Synced {len(active_tickers)} active tickers from Google Sheet: {active_tickers}")
                 return active_tickers
     except Exception as e:
-        print(f"Warning: Could not fetch from Google Sheet ({e}). Using default core watchlist.", file=sys.stderr)
+        print(f"Warning: Could not fetch from Google Sheet ({e}). Using default core.", file=sys.stderr)
     return DEFAULT_CORE
 
+def get_market_regime() -> dict:
+    """
+    Evaluates broader market regime using SPY trend and VIX volatility.
+    Filters out risky breakout setups during aggressive market pullbacks.
+    """
+    regime = {
+        "status": "NORMAL",
+        "spy_price": 0.0,
+        "spy_above_50": True,
+        "vix_level": 18.0,
+        "vix_extreme": False,
+        "allow_long_breakouts": True
+    }
+    try:
+        # Check SPY trend
+        spy_df = yf.download("SPY", period="6mo", interval="1d", progress=False)
+        if isinstance(spy_df.columns, pd.MultiIndex):
+            spy_df.columns = spy_df.columns.get_level_values(0)
+        if len(spy_df) >= 50:
+            spy_df["SMA_50"] = spy_df["Close"].rolling(50).mean()
+            current_spy = float(spy_df["Close"].iloc[-1])
+            spy_sma50 = float(spy_df["SMA_50"].iloc[-1])
+            regime["spy_price"] = round(current_spy, 2)
+            regime["spy_above_50"] = current_spy >= spy_sma50
+
+        # Check VIX level
+        vix_df = yf.download("^VIX", period="5d", interval="1d", progress=False)
+        if isinstance(vix_df.columns, pd.MultiIndex):
+            vix_df.columns = vix_df.columns.get_level_values(0)
+        if not vix_df.empty:
+            vix_val = float(vix_df["Close"].iloc[-1])
+            regime["vix_level"] = round(vix_val, 2)
+            regime["vix_extreme"] = vix_val >= 28.0
+
+        if not regime["spy_above_50"] or regime["vix_extreme"]:
+            regime["status"] = "RISK_OFF"
+            # In severe risk-off, restrict breakout buying or require higher bar
+            regime["allow_long_breakouts"] = False
+
+        print(f"Market Regime: {regime['status']} | SPY: ${regime['spy_price']} (Above 50: {regime['spy_above_50']}) | VIX: {regime['vix_level']}")
+    except Exception as e:
+        print(f"Warning checking market regime: {e}", file=sys.stderr)
+
+    return regime
+
 def get_intraday_volume_factor() -> float:
-    """Calculates expected volume progress based on elapsed trading hours (9:30 AM - 4:00 PM EST)."""
     try:
         now_utc = datetime.datetime.now(datetime.timezone.utc)
         market_open_minutes = 13 * 60 + 30
@@ -116,18 +154,7 @@ def calculate_atr(df: pd.DataFrame, period: int = 14) -> float:
     atr = tr.rolling(window=period).mean()
     return float(atr.iloc[-1])
 
-def get_spy_performance() -> float:
-    try:
-        spy_df = yf.download("SPY", period="1mo", interval="1d", progress=False)
-        if isinstance(spy_df.columns, pd.MultiIndex):
-            spy_df.columns = spy_df.columns.get_level_values(0)
-        if len(spy_df) >= 20:
-            return float((spy_df["Close"].iloc[-1] - spy_df["Close"].iloc[-20]) / spy_df["Close"].iloc[-20] * 100)
-    except Exception:
-        pass
-    return 0.0
-
-def evaluate_ticker(ticker: str, spy_perf_20d: float, is_discovery: bool = False) -> dict | None:
+def evaluate_ticker(ticker: str, spy_perf_20d: float, regime: dict, is_discovery: bool = False) -> dict | None:
     try:
         df = yf.download(ticker, period="1y", interval="1d", progress=False)
         if df.empty or len(df) < 200:
@@ -160,9 +187,11 @@ def evaluate_ticker(ticker: str, spy_perf_20d: float, is_discovery: bool = False
         pace_ratio = (current_volume / expected_vol) if expected_vol > 0 else 1.0
 
         pct_from_200 = (current_close - sma_200) / sma_200
-
-        # For automated discovery universe, require higher conviction (pace >= 1.5x)
         min_volume_pace = 1.5 if is_discovery else 1.2
+
+        # In Risk-Off, require higher volume pace (>= 1.8x)
+        if not regime["allow_long_breakouts"]:
+            min_volume_pace = max(min_volume_pace, 1.8)
 
         bullish_50_cross = (
             (prev_close <= float(prev["SMA_50"])) and
@@ -192,7 +221,8 @@ def evaluate_ticker(ticker: str, spy_perf_20d: float, is_discovery: bool = False
             notes = (
                 f"{tag}Bullish 50 SMA breakout at ${round(current_close, 2)}. "
                 f"Pacing at {round(pace_ratio, 2)}x volume. "
-                f"RSI {round(rsi_14, 1)}, Rel Strength vs SPY +{spy_relative_strength}%."
+                f"RSI {round(rsi_14, 1)}, Rel Strength vs SPY +{spy_relative_strength}%. "
+                f"Market Regime: {regime['status']} (VIX {regime['vix_level']})."
             )
         elif support_bounce:
             event_type = "200_SMA_SUPPORT_BOUNCE"
@@ -219,7 +249,9 @@ def evaluate_ticker(ticker: str, spy_perf_20d: float, is_discovery: bool = False
                 "atr": round(atr_14, 2),
                 "spy_rel_strength": spy_relative_strength,
                 "volume_ratio": round(pace_ratio, 2),
-                "notes": notes
+                "notes": notes,
+                "market_regime": regime["status"],
+                "vix": regime["vix_level"]
             }
 
         return None
@@ -229,30 +261,37 @@ def evaluate_ticker(ticker: str, spy_perf_20d: float, is_discovery: bool = False
         return None
 
 def main():
+    # Check if this is an End-of-Day Digest run
+    if len(sys.argv) > 1 and sys.argv[1] == "--digest":
+        run_eod_digest()
+        return
+
     if not SPARK_WEBHOOK_URL or not SPARK_WEBHOOK_SECRET:
         print("Missing SPARK_WEBHOOK_URL or SPARK_WEBHOOK_SECRET environment variables.", file=sys.stderr)
         sys.exit(1)
 
+    regime = get_market_regime()
     dispatched_cache = load_alert_cache()
-    spy_perf_20d = get_spy_performance()
 
-    # 1. Fetch core watchlist synchronized from Google Sheet (updated via Telegram / Sheets)
+    # Calculate SPY 20d return
+    try:
+        spy_df = yf.download("SPY", period="1mo", interval="1d", progress=False)
+        if isinstance(spy_df.columns, pd.MultiIndex): spy_df.columns = spy_df.columns.get_level_values(0)
+        spy_perf_20d = float((spy_df["Close"].iloc[-1] - spy_df["Close"].iloc[-20]) / spy_df["Close"].iloc[-20] * 100)
+    except Exception:
+        spy_perf_20d = 0.0
+
     core_watchlist = fetch_watchlist_from_google_sheet()
-    
-    # 2. Combine with S&P 500 / Nasdaq 100 discovery universe (deduplicated)
     all_tickers = []
     for sym in core_watchlist:
-        if sym not in all_tickers:
-            all_tickers.append((sym, False))
+        if sym not in all_tickers: all_tickers.append((sym, False))
     for sym in TOP_UNIVERSE_DISCOVERY:
-        if sym not in [t[0] for t in all_tickers]:
-            all_tickers.append((sym, True))
+        if sym not in [t[0] for t in all_tickers]: all_tickers.append((sym, True))
 
-    print(f"Scanning total of {len(all_tickers)} tickers ({len(core_watchlist)} core + {len(TOP_UNIVERSE_DISCOVERY)} discovery)...")
-
+    print(f"Scanning total of {len(all_tickers)} tickers...")
     alerts_to_send = []
     for ticker, is_discovery in all_tickers:
-        signal = evaluate_ticker(ticker, spy_perf_20d, is_discovery=is_discovery)
+        signal = evaluate_ticker(ticker, spy_perf_20d, regime, is_discovery=is_discovery)
         if signal:
             alert_key = f"{ticker}_{signal['event']}"
             if alert_key in dispatched_cache:
@@ -266,7 +305,7 @@ def main():
 
     for alert_key, alert in alerts_to_send:
         try:
-            res = requests.post(SPARK_WEBHOOK_URL, json=alert, timeout=10)
+            res = requests.post(SPARK_WEBHOOK_URL, json=alert, timeout=15)
             if res.status_code == 200:
                 dispatched_cache.add(alert_key)
                 print(f"Dispatched alert for {alert['ticker']} ({alert['event']}) | HTTP 200")
@@ -276,6 +315,26 @@ def main():
             print(f"Failed to post alert for {alert['ticker']}: {e}", file=sys.stderr)
 
     save_alert_cache(dispatched_cache)
+
+def run_eod_digest():
+    """Runs at market close: generates daily performance summary and sends to webhook."""
+    if not SPARK_WEBHOOK_URL or not SPARK_WEBHOOK_SECRET:
+        return
+
+    core = fetch_watchlist_from_google_sheet()
+    regime = get_market_regime()
+    digest_payload = {
+        "secret_key": SPARK_WEBHOOK_SECRET,
+        "event": "EOD_DIGEST",
+        "ticker": "MARKET_SUMMARY",
+        "price": regime.get("spy_price", 0.0),
+        "notes": f"Daily Market Close Summary | SPY: ${regime.get('spy_price')} | VIX: {regime.get('vix_level')} | Watched {len(core)} core tickers."
+    }
+    try:
+        res = requests.post(SPARK_WEBHOOK_URL, json=digest_payload, timeout=20)
+        print(f"Dispatched EOD Digest | HTTP {res.status_code}")
+    except Exception as e:
+        print(f"Failed to post EOD Digest: {e}")
 
 if __name__ == "__main__":
     main()
