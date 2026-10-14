@@ -2,9 +2,17 @@ name: Market Scanner Schedule
 
 on:
   schedule:
-    # Runs at minutes 17 and 47 past every hour between 14:00 and 20:00 UTC, Mon-Fri
+    # Runs at minutes 17 and 47 past every hour between 14:00 and 20:00 UTC, Mon-Fri (Regular market hours)
     - cron: '17,47 14-20 * * 1-5'
-  workflow_dispatch: # Allows manual trigger from GitHub UI for testing
+    # Runs at 20:15 UTC (4:15 PM EST) for the End-of-Day Market Digest
+    - cron: '15 20 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      run_digest:
+        description: 'Run End-of-Day Digest instead of scanner'
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   run-scanner:
@@ -30,4 +38,9 @@ jobs:
         env:
           SPARK_WEBHOOK_URL: ${{ secrets.SPARK_WEBHOOK_URL }}
           SPARK_WEBHOOK_SECRET: ${{ secrets.SPARK_WEBHOOK_SECRET }}
-        run: python scanner.py
+        run: |
+          if [ "${{ github.event.schedule }}" = "15 20 * * 1-5" ] || [ "${{ inputs.run_digest }}" = "true" ]; then
+            python scanner.py --digest
+          else
+            python scanner.py
+          fi
