@@ -81,7 +81,6 @@ def fetch_watchlist_from_google_sheet() -> list:
 
 def fetch_open_trades_from_journal() -> list:
     """Fetches open trades from 'Trades Journal' tab to track take-profit and stop-loss levels."""
-    # Using gid or export format if accessible
     csv_url = f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/gviz/tq?tqx=out:csv&sheet=Trades%20Journal"
     trades = []
     try:
@@ -90,60 +89,91 @@ def fetch_open_trades_from_journal() -> list:
             content = resp.read().decode("utf-8")
             reader = csv.DictReader(io.StringIO(content))
             for row in reader:
-                if row.get("Status") == "EXECUTED" and row.get("Ticker"):
+                status = row.get("Status", "").strip().upper()
+                if status in ["EXECUTED", "ACTIVE"] and row.get("Ticker"):
                     try:
+                        p_str = row.get("Price", "0").replace("$", "").replace(",", "").strip()
                         trades.append({
                             "date": row.get("Date"),
                             "ticker": row.get("Ticker").strip().upper(),
                             "event": row.get("Event"),
-                            "entry_price": float(row.get("Price", 0)),
+                            "entry_price": float(p_str),
                             "row": row
                         })
                     except Exception:
                         pass
     except Exception as e:
-        print(f"Warning fetching Trades Journal: {e}", file=sys.stderr)
+        print(f"Warning: Could not fetch open trades from journal ({e}).", file=sys.stderr)
     return trades
 
 def check_earnings_blackout(ticker: str) -> dict:
-    """Checks if earnings date is within the next 5 trading days."""
+    """Checks if an earnings report is scheduled within 5 days (Blackout window)."""
     try:
         t = yf.Ticker(ticker)
-        cal = t.calendar
-        if isinstance(cal, dict) and "Earnings Date" in cal:
-            edates = cal["Earnings Date"]
-            if edates and len(edates) > 0:
-                edate = edates[0]
-                if isinstance(edate, datetime.datetime): edate = edate.date()
-                today = datetime.datetime.now(datetime.timezone.utc).date()
-                days_until = (edate - today).days
-                if 0 <= days_until <= 5:
-                    return {"blackout": True, "days_until": days_until, "date": str(edate)}
-                elif days_until > 5:
-                    return {"blackout": False, "days_until": days_until, "date": str(edate)}
+        calendar = t.calendar
+        earnings_date = None
+
+        if isinstance(calendar, pd.DataFrame) and not calendar.empty:
+            if "Earnings Date" in calendar.index:
+                val = calendar.loc["Earnings Date"].iloc[0]
+                if isinstance(val, (datetime.date, datetime.datetime, pd.Timestamp)):
+                    earnings_date = pd.to_datetime(val).tz_localize(None)
+        elif isinstance(calendar, dict) and "Earnings Date" in calendar:
+            vals = calendar["Earnings Date"]
+            if vals and len(vals) > 0:
+                earnings_date = pd.to_datetime(vals[0]).tz_localize(None)
+
+        if earnings_date is not None:
+            now = pd.to_datetime(datetime.datetime.now(datetime.timezone.utc).date())
+            days_until = (earnings_date - now).days
+            if 0 <= days_until <= 5:
+                return {"blackout": True, "days_until": days_until}
+            return {"blackout": False, "days_until": days_until}
     except Exception:
         pass
-    return {"blackout": False, "days_until": None, "date": None}
+    return {"blackout": False, "days_until": None}
 
 def check_weekly_trend(ticker: str) -> bool:
-    """Weekly timeframe alignment: verifies weekly close > 20-week EMA."""
+    """Verifies that the ticker is trading above its Weekly 20 EMA."""
     try:
-        df_w = yf.download(ticker, period="1y", interval="1wk", progress=False)
-        if isinstance(df_w.columns, pd.MultiIndex): df_w.columns = df_w.columns.get_level_values(0)
-        if len(df_w) >= 20:
-            ema_20w = df_w["Close"].ewm(span=20).mean().iloc[-1]
-            last_w = df_w["Close"].iloc[-1]
-            return bool(float(last_w) >= float(ema_20w))
+        w_df = yf.download(ticker, period="1y", interval="1wk", progress=False)
+        if isinstance(w_df.columns, pd.MultiIndex): w_df.columns = w_df.columns.get_level_values(0)
+        if len(w_df) >= 20:
+            w_df["EMA_20"] = w_df["Close"].ewm(span=20, adjust=False).mean()
+            return float(w_df["Close"].iloc[-1]) >= float(w_df["EMA_20"].iloc[-1])
     except Exception:
         pass
     return True
+
+def check_ttm_squeeze(df: pd.DataFrame) -> bool:
+    """Calculates whether Bollinger Bands are inside Keltner Channels (TTMSqueeze compression)."""
+    try:
+        if len(df) < 20: return False
+        sma_20 = df["Close"].rolling(20).mean()
+        std_20 = df["Close"].rolling(20).std()
+        bb_upper = sma_20 + 2.0 * std_20
+        bb_lower = sma_20 - 2.0 * std_20
+
+        high = df["High"]
+        low = df["Low"]
+        close = df["Close"]
+        prev_close = close.shift(1)
+        tr = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
+        atr_20 = tr.rolling(20).mean()
+        kc_upper = sma_20 + 1.5 * atr_20
+        kc_lower = sma_20 - 1.5 * atr_20
+
+        squeeze = (bb_lower.iloc[-1] > kc_lower.iloc[-1]) and (bb_upper.iloc[-1] < kc_upper.iloc[-1])
+        return bool(squeeze)
+    except Exception:
+        return False
 
 def get_market_regime() -> dict:
     regime = {
         "status": "NORMAL",
         "spy_price": 0.0,
         "spy_above_50": True,
-        "vix_level": 18.0,
+        "vix_level": 0.0,
         "vix_extreme": False,
         "allow_long_breakouts": True
     }
@@ -254,12 +284,15 @@ def evaluate_ticker(ticker: str, spy_perf_20d: float, regime: dict, is_discovery
         # 2. Multi-timeframe Weekly Trend check for 50 SMA breakouts
         weekly_bullish = check_weekly_trend(ticker)
 
+        # 3. TTMSqueeze Compression Check
+        squeeze_active = check_ttm_squeeze(df)
+
         rsi_14 = calculate_rsi(df["Close"])
         atr_14 = calculate_atr(df)
         ticker_perf_20d = float((current_close - df["Close"].iloc[-20]) / df["Close"].iloc[-20] * 100)
         spy_relative_strength = round(ticker_perf_20d - spy_perf_20d, 2)
 
-        # 3. Sector Confirmation
+        # 4. Sector Confirmation
         sector_etf = SECTOR_MAP.get(ticker, "SPY")
         sector_perf = get_sector_performance(sector_etf)
 
@@ -298,10 +331,11 @@ def evaluate_ticker(ticker: str, spy_perf_20d: float, regime: dict, is_discovery
 
         if bullish_50_cross:
             event_type = "50_SMA_BREAKOUT_VOLUME"
+            squeeze_note = " · TTMSqueeze Active!" if squeeze_active else ""
             notes = (
                 f"{tag}Bullish 50 SMA breakout at ${round(current_close, 2)}. "
                 f"Pacing at {round(pace_ratio, 2)}x volume. RSI {round(rsi_14, 1)}, Rel Strength vs SPY +{spy_relative_strength}%. "
-                f"Weekly Trend: BULLISH (>20w EMA). Sector ({sector_etf}): {sector_perf}%."
+                f"Weekly Trend: BULLISH (>20w EMA). Sector ({sector_etf}): {sector_perf}%{squeeze_note}."
             )
         elif support_bounce:
             event_type = "200_SMA_SUPPORT_BOUNCE"
@@ -332,6 +366,7 @@ def evaluate_ticker(ticker: str, spy_perf_20d: float, regime: dict, is_discovery
                 "weekly_bullish": weekly_bullish,
                 "volume_ratio": round(pace_ratio, 2),
                 "earnings_days": earnings_info.get("days_until"),
+                "squeeze_active": squeeze_active,
                 "notes": notes,
                 "market_regime": regime["status"],
                 "vix": regime["vix_level"]
@@ -343,7 +378,7 @@ def evaluate_ticker(ticker: str, spy_perf_20d: float, regime: dict, is_discovery
         return None
 
 def monitor_open_trades():
-    """Monitors journaled active trades for Take-Profit (+2R / +1.5x ATR) or Stop-Loss hits."""
+    """Monitors journaled active trades for Take-Profit (+1.5R / +2.5R) or Stop-Loss hits."""
     trades = fetch_open_trades_from_journal()
     if not trades or not SPARK_WEBHOOK_URL or not SPARK_WEBHOOK_SECRET:
         return
@@ -352,29 +387,35 @@ def monitor_open_trades():
         sym = t["ticker"]
         entry = t["entry_price"]
         try:
-            df = yf.download(sym, period="5d", interval="1d", progress=False)
+            df = yf.download(sym, period="1mo", interval="1d", progress=False)
             if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
-            if df.empty: continue
+            if df.empty or len(df) < 14: continue
             cur_price = round(float(df["Close"].iloc[-1]), 2)
             pct_gain = round((cur_price - entry) / entry * 100, 2)
+            atr_val = calculate_atr(df, period=14)
+            stop_dist = max(1.0, atr_val * 1.5)
 
-            # Check if profit target (+4% or +8%) or stop reached (-3%)
-            if pct_gain >= 4.0:
+            tp1 = round(entry + stop_dist * 1.5, 2)
+            tp2 = round(entry + stop_dist * 2.5, 2)
+            sl = round(entry - stop_dist, 2)
+
+            if cur_price >= tp1:
+                target_str = "TP2 (+2.5R)" if cur_price >= tp2 else "TP1 (+1.5R)"
                 payload = {
                     "secret_key": SPARK_WEBHOOK_SECRET,
                     "event": "TRADE_MANAGEMENT_UPDATE",
                     "ticker": sym,
                     "price": cur_price,
-                    "notes": f"🎯 Take Profit Alert: {sym} is up +{pct_gain}% from entry (${entry} -> ${cur_price}). Suggest trailing stop to breakeven (${entry})."
+                    "notes": f"🎯 Take Profit Alert ({target_str}): {sym} reached ${cur_price} (+{pct_gain}% from entry ${entry}). Suggest trailing stop to breakeven (${entry}) or taking partial profits."
                 }
                 requests.post(SPARK_WEBHOOK_URL, json=payload, timeout=10)
-            elif pct_gain <= -3.0:
+            elif cur_price <= sl:
                 payload = {
                     "secret_key": SPARK_WEBHOOK_SECRET,
                     "event": "TRADE_MANAGEMENT_UPDATE",
                     "ticker": sym,
                     "price": cur_price,
-                    "notes": f"⚠️ Risk Warning: {sym} has pulled back {pct_gain}% below entry (${entry} -> ${cur_price}). Check stop loss level."
+                    "notes": f"⚠️ Stop-Loss Risk Hit: {sym} has declined to ${cur_price} ({pct_gain}% from entry ${entry}), reaching the calculated stop level (${sl}). Protect capital."
                 }
                 requests.post(SPARK_WEBHOOK_URL, json=payload, timeout=10)
         except Exception as e:
@@ -409,7 +450,7 @@ def main():
     for sym in TOP_UNIVERSE_DISCOVERY:
         if sym not in [t[0] for t in all_tickers]: all_tickers.append((sym, True))
 
-    print(f"Evaluating {len(all_tickers)} tickers with Multi-Timeframe, Sector Confluence, and Earnings Blackout...")
+    print(f"Evaluating {len(all_tickers)} tickers with Multi-Timeframe, TTMSqueeze, Sector Confluence, and Earnings Blackout...")
     alerts_to_send = []
     for ticker, is_discovery in all_tickers:
         signal = evaluate_ticker(ticker, spy_perf_20d, regime, is_discovery=is_discovery)
